@@ -1,0 +1,15 @@
+{
+  "name": "velan-metrology-dashboard",
+  "version": "1.0.0",
+  "description": "Velan Metrology Production Command Center Dashboard",
+  "scripts": {
+    "start": "npx live-server --port=3000 --open=index.html",
+    "dev": "npx live-server --port=3000 --open=index.html --watch=index.html"
+  },
+  "keywords": ["dashboard", "production", "metrology"],
+  "author": "Velan Metrology",
+  "license": "ISC",
+  "devDependencies": {
+    "live-server": "^1.2.2"
+  }
+}
