@@ -625,67 +625,199 @@ function App() {
   const [now] = useState(new Date());
 
   // ── PARSE UPLOADED EXCEL / JSON ──────────────────────────────────────────
+  const [uploadStatus, setUploadStatus] = useState(null);
+
+  // ── Auto-detect product TYPE from product name ────────────────────────────
+  function inferType(productName) {
+    if(!productName) return 'ACCESSORY';
+    const p = String(productName).toUpperCase().trim();
+    if(p.startsWith('APG') || p.startsWith('2 PAIR APG')) return 'APG';
+    if(p.startsWith('ARG')) return 'ARG';
+    if(p.startsWith('SRG')) return 'SRG';
+    if(p.startsWith('SP ') || p.startsWith('SP\t') || p === 'SP' || /^SP DIA/.test(p)) return 'SP';
+    if(p.startsWith('SPG')) return 'SPG';
+    return 'ACCESSORY';
+  }
+
+  // ── Parse the real Velan Excel format (merged cells / no type column) ─────
+  function parseVelanExcel(rows) {
+    // rows is raw array-of-arrays from XLSX with header=none
+    // Structure: 
+    //   Col 0=SNO, 1=PO NO, 2=PO RECD DATE, 3=SC, 4=CustomerName(merged row),
+    //   5=Product Name, 6=QTY, 7=STATUS1, 8=STATUS2, 9=INHOUSE/VENDOR, 10=OP(stage), 11=TIMESTAMP
+    // PO NO and PO DATE fill down within a PO group (only in first row of group)
+    // SC fills down within SC sub-group
+
+    const result = [];
+    let currentPO = '', currentPODate = '', currentSC = '';
+
+    for(const row of rows) {
+      const v = (i) => (row[i] !== undefined && row[i] !== null && String(row[i]).trim() !== '' && String(row[i]).trim() !== 'nan') ? String(row[i]).trim() : null;
+
+      // Skip header rows and title rows
+      const col1 = v(1); const col5 = v(5);
+      if(!col5 || col5 === 'Product Name' || col5 === 'Customer Name') continue;
+      if(col1 && (col1.includes('VELAN') || col1 === 'PO NO')) continue;
+
+      // Update running PO and date if present in this row
+      if(col1 && col1 !== 'NaN' && !col1.includes('SETS') && !col1.match(/^\d{4}/) ) currentPO = col1;
+      const col2 = v(2);
+      if(col2 && col2.includes('-')) {
+        // looks like a date
+        const d = col2.substring(0,10);
+        if(/\d{4}-\d{2}-\d{2}/.test(d)) currentPODate = d;
+      }
+
+      // SC: col3 may have the SC value; sometimes has "1166- 3 SETS" note — strip that
+      const col3 = v(3);
+      if(col3 && !col3.toUpperCase().includes('SET')) {
+        currentSC = col3.replace(/\s+/g,''); // normalize SC like "1166- 2" → "1166-2"
+      }
+
+      const product = col5;
+      const status1 = v(7) || '';
+      const status2 = v(8) || '';
+      const inhouseRaw = v(9) || 'INHOUSE';
+      const inhouse = inhouseRaw.toUpperCase().includes('VENDOR') ? 'VENDOR' : 'INHOUSE';
+      const currentStage = v(10) || '';
+      const tsRaw = v(11) || '';
+      const timestamp = tsRaw.substring(0,19).replace('T',' ');
+      const type = inferType(product);
+
+      if(currentSC && product) {
+        result.push({
+          sc: currentSC,
+          po: currentPO,
+          poDate: currentPODate,
+          product,
+          type,
+          status1,
+          status2,
+          inhouse,
+          currentStage,
+          timestamp,
+        });
+      }
+    }
+    return result;
+  }
+
+  // ── Generic flat-row parser (standard CSV/Excel with headers) ────────────
+  function parseGenericRows(rows) {
+    const norm = s => String(s||'').replace(/[\s\/\-_]+/g,'').toLowerCase();
+    const pickField = (r, candidates) => {
+      for(const c of candidates) {
+        const val = r[norm(c)];
+        if(val !== undefined && val !== null && String(val).trim() !== '') return String(val).trim();
+      }
+      for(const c of candidates) {
+        const word = norm(c);
+        for(const k of Object.keys(r)) {
+          if(norm(k).includes(word) && r[k] !== undefined && r[k] !== null && String(r[k]).trim() !== '')
+            return String(r[k]).trim();
+        }
+      }
+      return '';
+    };
+    const normalizeHeaders = row => {
+      const n = {};
+      Object.entries(row).forEach(([k,v]) => { n[norm(k)] = v; });
+      return n;
+    };
+    return rows.map(raw => {
+      const r = normalizeHeaders(raw);
+      const product = pickField(r, ['product name','productname','product','item description','description']);
+      const typeRaw  = pickField(r, ['type','product type','producttype','dtype']);
+      const type     = typeRaw || inferType(product);
+      const inhouseRaw = pickField(r, ['inhouse/ vendor','inhouse/vendor','inhousevendor','inhouse vendor','inhouse','location','vendor status']);
+      const inhouse  = inhouseRaw.toUpperCase().includes('VENDOR') ? 'VENDOR' : inhouseRaw ? 'INHOUSE' : 'INHOUSE';
+      return {
+        sc:           pickField(r, ['sc','sc no','sc#','scno']).replace(/\s+/g,''),
+        po:           pickField(r, ['po no','pono','po','purchase order']),
+        poDate:       pickField(r, ['po recd date','porecddate','po date','podate','date received','date']).substring(0,10),
+        product,
+        type,
+        status1:      pickField(r, ['status 1','status1','current operation','operation']),
+        status2:      pickField(r, ['status 2','status2','next operation']),
+        inhouse,
+        currentStage: pickField(r, ['currentstage','current stage','stage','op timestamp','op','optimestamp']),
+        timestamp:    pickField(r, ['timestamp','time stamp','last updated','op time']).substring(0,19),
+      };
+    }).filter(r => r.sc || r.po);
+  }
+
   function handleFileUpload(file) {
     if(!file) return;
     const ext = file.name.split('.').pop().toLowerCase();
     const reader = new FileReader();
+    setUploadStatus({type:'loading', msg:`⏳ Reading "${file.name}"…`});
 
-    const normalizeHeaders = row => {
-      const normalized = {};
-      Object.entries(row).forEach(([key, value]) => {
-        const name = String(key || '').trim().toLowerCase();
-        normalized[name] = value;
-      });
-      return normalized;
-    };
-
-    const parseRows = rows => {
-      const mapped = rows.map(raw => {
-        const r = normalizeHeaders(raw);
-        return {
-          sc: String(r['sc'] || r['sc no'] || r['sc#'] || '').trim(),
-          po: String(r['po no'] || r['po'] || r['pono'] || r['purchase order'] || '').trim(),
-          poDate: String(r['po recd date'] || r['po date'] || r['podate'] || r['date'] || '').trim(),
-          product: String(r['product name'] || r['product'] || r['item description'] || r['description'] || '').trim(),
-          type: String(r['type'] || r['product type'] || r['dtype'] || '').trim(),
-          status1: String(r['status 1'] || r['status1'] || r['operation'] || r['current operation'] || '').trim(),
-          status2: String(r['status 2'] || r['status2'] || r['next operation'] || '').trim(),
-          inhouse: String(r['inhouse/ vendor'] || r['inhouse/vendor'] || r['inhouse'] || r['vendor'] || 'INHOUSE').trim(),
-          currentStage: String(r['currentstage'] || r['current stage'] || r['stage'] || r['op timestamp'] || '').trim(),
-          timestamp: String(r['timestamp'] || r['time stamp'] || r['last updated'] || '').trim(),
-        };
-      });
-      const filteredRows = mapped.filter(r => r.sc || r.po);
-      if(filteredRows.length === 0) {
-        alert('No valid rows found. Please check the column headers in your file.');
+    const finalize = (rows, fileName) => {
+      if(!rows || rows.length === 0) {
+        setUploadStatus({type:'error', msg:'No valid rows found in file.', detail:'Check that the file has data and correct column names.'});
+        return;
       }
-      setData(filteredRows);
+      const missingStage = rows.filter(r=>!r.currentStage).length;
+      setData(rows);
+      setUploadStatus({
+        type:'success',
+        msg:`✅ ${rows.length} rows loaded from "${fileName}" — types auto-detected from product names`,
+        detail: missingStage > 0 ? `⚠ ${missingStage} rows have no stage value` : null,
+      });
     };
 
     if(ext === 'json') {
       reader.onload = e => {
-        try { setData(JSON.parse(e.target.result)); }
-        catch(err) { alert('Invalid JSON'); }
+        try {
+          const parsed = JSON.parse(e.target.result);
+          const rows = Array.isArray(parsed) ? parsed : [parsed];
+          // auto-detect type if missing
+          rows.forEach(r => { if(!r.type) r.type = inferType(r.product||r['Product Name']||''); });
+          finalize(rows, file.name);
+        } catch(err) { setUploadStatus({type:'error', msg:'Invalid JSON.', detail:String(err)}); }
       };
       reader.readAsText(file);
+
     } else if(['xlsx','xls'].includes(ext)) {
       reader.onload = e => {
-        const wb = XLSX.read(e.target.result, { type: 'array' });
-        const ws = wb.Sheets[wb.SheetNames[0]];
-        const rows = XLSX.utils.sheet_to_json(ws, { defval: '' });
-        parseRows(rows);
+        try {
+          const wb = XLSX.read(e.target.result, {type:'array', cellDates:true, raw:false});
+          const ws = wb.Sheets[wb.SheetNames[0]];
+
+          // Try raw array-of-arrays first to detect Velan format
+          const rawAoA = XLSX.utils.sheet_to_json(ws, {header:1, defval:null, raw:false});
+          // Detect Velan format: row 1 or 2 contains "VELAN METROLOGY" or headers look like SNO/PO NO/SC
+          const isVelanFormat = rawAoA.slice(0,5).some(row =>
+            row && row.some(cell => cell && String(cell).includes('VELAN METROLOGY'))
+          ) || rawAoA.slice(0,6).some(row =>
+            row && row.some(cell => String(cell||'').trim() === 'SNO')
+          );
+
+          if(isVelanFormat) {
+            const parsed = parseVelanExcel(rawAoA);
+            finalize(parsed, file.name);
+          } else {
+            // Standard flat format with headers
+            const rows = XLSX.utils.sheet_to_json(ws, {defval:'', raw:false});
+            finalize(parseGenericRows(rows), file.name);
+          }
+        } catch(err) { setUploadStatus({type:'error', msg:'Failed to read Excel.', detail:String(err)}); }
       };
       reader.readAsArrayBuffer(file);
+
     } else if(ext === 'csv') {
       reader.onload = e => {
-        const wb = XLSX.read(e.target.result, { type: 'string' });
-        const ws = wb.Sheets[wb.SheetNames[0]];
-        const rows = XLSX.utils.sheet_to_json(ws, { defval: '' });
-        parseRows(rows);
+        try {
+          const wb = XLSX.read(e.target.result, {type:'string'});
+          const ws = wb.Sheets[wb.SheetNames[0]];
+          const rows = XLSX.utils.sheet_to_json(ws, {defval:''});
+          finalize(parseGenericRows(rows), file.name);
+        } catch(err) { setUploadStatus({type:'error', msg:'Failed to parse CSV.', detail:String(err)}); }
       };
       reader.readAsText(file);
+
     } else {
-      alert('Supported file types: xlsx, xls, csv, json');
+      setUploadStatus({type:'error', msg:`Unsupported file type: .${ext}`, detail:'Supported: .xlsx, .xls, .csv, .json'});
     }
   }
 
@@ -872,7 +1004,7 @@ function App() {
           {activeNav==='po' && <POPage kpis={kpis} poGroups={poGroups}/>}
           {activeNav==='sc' && <SCPage kpis={kpis} scGroups={scGroups}/>}
           {activeNav==='vendor' && <VendorPage kpis={kpis}/>}
-          {activeNav==='upload' && <UploadPage onUpload={handleFileUpload} data={data}/>}
+          {activeNav==='upload' && <UploadPage onUpload={handleFileUpload} data={data} uploadStatus={uploadStatus} setUploadStatus={setUploadStatus}/>}
         </div>
       </div>
     </div>
@@ -1371,25 +1503,38 @@ function VendorPage({kpis}) {
 }
 
 // ─── UPLOAD PAGE ───────────────────────────────────────────────────────────────
-function UploadPage({onUpload, data}) {
+function UploadPage({onUpload, data, uploadStatus, setUploadStatus}) {
   const [drag, setDrag] = useState(false);
   const fileRef = useRef();
 
   function handleDrop(e) {
     e.preventDefault(); setDrag(false);
     const file = e.dataTransfer.files[0];
-    if(file) onUpload(file);
+    if(file) { onUpload(file); }
+  }
+
+  function handleFileChange(e) {
+    const file = e.target.files[0];
+    if(file) {
+      onUpload(file);
+      // Reset input so same file can be re-uploaded
+      e.target.value = '';
+    }
   }
 
   function downloadTemplate() {
-    const ws = XLSX.utils.json_to_sheet([{
-      'SC':'1170','PO NO':'AGIPLPO2326','PO RECD DATE':'2026-03-25',
-      'Product Name':'ARG DIA 15.2 +0.03','type':'ARG',
-      'STATUS 1':'LATHE COMPLETED, MOVE TO M1','STATUS 2':'MOVE TO STORES',
-      'INHOUSE/ VENDOR':'INHOUSE','currentStage':'READY','timestamp':'2026-04-15 19:20:04'
-    }]);
+    const rows = [
+      {'SNO':1,'PO NO':'AGIPLPO2326','PO RECD DATE':'2026-03-25','SC':'1170','Product Name':'ARG DIA 15.2 +0.03','QTY':'1 NO','STATUS 1':'LATHE COMPLETED, MOVE TO M1','STATUS 2':'MOVE TO STORES','INHOUSE/ VENDOR':'INHOUSE','OP':'READY','TIMESTAMP':'2026-04-15 19:20:04'},
+      {'SNO':'','PO NO':'','PO RECD DATE':'','SC':'1170','Product Name':'SP DIA 15.2 +0.03','QTY':'1 SET','STATUS 1':'SET MOVE TO FB','STATUS 2':'MOVE TO STORES','INHOUSE/ VENDOR':'INHOUSE','OP':'READY','TIMESTAMP':'2026-04-15 19:24:04'},
+      {'SNO':'','PO NO':'','PO RECD DATE':'','SC':'1170','Product Name':'M6 T CONNECTOR','QTY':'1 NO','STATUS 1':'INHOUSE','STATUS 2':'','INHOUSE/ VENDOR':'INHOUSE','OP':'STOCK','TIMESTAMP':'2026-03-30 11:03:33'},
+      {'SNO':2,'PO NO':'AGIPLPO14','PO RECD DATE':'2026-03-25','SC':'1187','Product Name':'APG DIA 24.0 -0.007/-0.028','QTY':'1 NO','STATUS 1':'MOVE TO FB','STATUS 2':'MOVE TO STORES','INHOUSE/ VENDOR':'INHOUSE','OP':'READY','TIMESTAMP':'2026-04-13 18:14:43'},
+      {'SNO':'','PO NO':'','PO RECD DATE':'','SC':'1187','Product Name':'SRG DIA 24.0 -0.007/-0.028','QTY':'1 NO','STATUS 1':'HT,SZ COMPLETED,MOVE TO SG','STATUS 2':'MOVE TO STORES','INHOUSE/ VENDOR':'INHOUSE','OP':'READY','TIMESTAMP':'2026-04-13 18:23:27'},
+      {'SNO':'','PO NO':'','PO RECD DATE':'','SC':'1187','Product Name':'VERTICAL BENCH MOUNT PLATE','QTY':'1 NO','STATUS 1':'INHOUSE','STATUS 2':'','INHOUSE/ VENDOR':'VENDOR','OP':'SDV','TIMESTAMP':'2026-04-13 17:01:58'},
+    ];
+    const ws = XLSX.utils.json_to_sheet(rows);
+    ws['!cols'] = [{wch:5},{wch:14},{wch:14},{wch:10},{wch:30},{wch:8},{wch:35},{wch:20},{wch:14},{wch:10},{wch:22}];
     const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, 'Production');
+    XLSX.utils.book_append_sheet(wb, ws, 'stdtrack');
     XLSX.writeFile(wb, 'velan_template.xlsx');
   }
 
@@ -1400,41 +1545,115 @@ function UploadPage({onUpload, data}) {
     XLSX.writeFile(wb, `velan_export_${new Date().toISOString().substring(0,10)}.xlsx`);
   }
 
+  const statusColors = {
+    success:{bg:'rgba(0,230,118,0.1)',border:'rgba(0,230,118,0.4)',color:'var(--success)'},
+    error:  {bg:'rgba(255,61,90,0.1)', border:'rgba(255,61,90,0.4)',  color:'var(--danger)'},
+    warn:   {bg:'rgba(255,184,54,0.1)',border:'rgba(255,184,54,0.4)', color:'var(--warning)'},
+    loading:{bg:'rgba(0,201,255,0.08)',border:'rgba(0,201,255,0.3)',  color:'var(--accent1)'},
+  };
+
   return (
     <div>
       <div className="section-title">Data <span>Upload</span><div className="section-line"/></div>
+
+      {/* Status Banner */}
+      {uploadStatus && (
+        <div style={{
+          background: statusColors[uploadStatus.type]?.bg || statusColors.loading.bg,
+          border: `1px solid ${statusColors[uploadStatus.type]?.border || statusColors.loading.border}`,
+          borderRadius:10, padding:'14px 18px', marginBottom:16,
+          display:'flex', justifyContent:'space-between', alignItems:'flex-start', gap:12
+        }}>
+          <div>
+            <div style={{color: statusColors[uploadStatus.type]?.color || statusColors.loading.color, fontWeight:700, fontSize:14}}>
+              {uploadStatus.msg}
+            </div>
+            {uploadStatus.detail && (
+              <div style={{color:'var(--text-muted)', fontSize:11, fontFamily:'Share Tech Mono, monospace', marginTop:6, whiteSpace:'pre-line'}}>
+                {uploadStatus.detail}
+              </div>
+            )}
+          </div>
+          <button onClick={()=>setUploadStatus(null)} style={{background:'none',border:'none',color:'var(--text-muted)',cursor:'pointer',fontSize:18,lineHeight:1,padding:0,flexShrink:0}}>✕</button>
+        </div>
+      )}
+
       <div className="chart-grid" style={{gridTemplateColumns:'1fr 1fr'}}>
         <div className="chart-card">
           <div className="chart-title">Upload New Data</div>
-          <div className="chart-sub">EXCEL (.XLSX / .XLS), CSV, OR JSON FORMAT</div>
-          <div className="upload-zone" style={{marginTop:16,background:drag?'rgba(0,201,255,0.1)':''}}
+          <div className="chart-sub">EXCEL (.XLSX / .XLS), CSV, OR JSON — FLEXIBLE COLUMN NAMES SUPPORTED</div>
+          <div
+            className={`upload-zone${drag?' drag':''}`}
+            style={{marginTop:16}}
             onDragOver={e=>{e.preventDefault();setDrag(true)}}
             onDragLeave={()=>setDrag(false)}
             onDrop={handleDrop}
-            onClick={()=>fileRef.current.click()}>
-            <div className="upload-icon">📤</div>
-            <div className="upload-text">Drag & Drop your file here</div>
+            onClick={()=>fileRef.current.click()}
+          >
+            <div className="upload-icon">{uploadStatus?.type==='loading'?'⏳':'📤'}</div>
+            <div className="upload-text">
+              {uploadStatus?.type==='loading' ? 'Processing file…' : 'Drag & Drop your file here'}
+            </div>
             <div className="upload-sub">or click to browse — xlsx, xls, csv, json</div>
-            <input ref={fileRef} type="file" accept=".xlsx,.xls,.csv,.json" style={{display:'none'}} onChange={e=>{ if(e.target.files[0]) onUpload(e.target.files[0]); }}/>
+            <input
+              ref={fileRef}
+              type="file"
+              accept=".xlsx,.xls,.csv,.json"
+              style={{display:'none'}}
+              onChange={handleFileChange}
+            />
           </div>
+
+          {/* Tips */}
+          <div style={{marginTop:12,padding:'10px 14px',background:'rgba(0,201,255,0.05)',border:'1px solid rgba(0,201,255,0.15)',borderRadius:8}}>
+            <div style={{fontSize:10,letterSpacing:2,color:'var(--text-muted)',fontFamily:'Share Tech Mono,monospace',marginBottom:6}}>TIPS — WHAT YOUR EXCEL NEEDS</div>
+            <ul style={{color:'var(--text-secondary)',fontSize:11,paddingLeft:16,lineHeight:1.9}}>
+              <li><span className="mono text-accent">No "type" column needed</span> — product type is auto-detected from the product name (APG, SRG, ARG, SP, etc.)</li>
+              <li>Your Velan Excel format is <span className="mono text-accent">natively supported</span> — merged cells, PO fill-down, and the SNO/SC structure all parse correctly</li>
+              <li>Required columns: <span className="mono text-accent">SC, PO NO, PO RECD DATE, Product Name, STATUS 1, INHOUSE/VENDOR, OP, TIMESTAMP</span></li>
+              <li>The <span className="mono text-accent">OP</span> column (currentStage) drives all charts — make sure it has values like READY, LATHE, VA, CG etc.</li>
+              <li>You can re-upload the same file — it reloads fresh each time</li>
+            </ul>
+          </div>
+
           <div style={{display:'flex',gap:10,marginTop:14}}>
             <button className="filter-btn" onClick={downloadTemplate} style={{flex:1,padding:'10px'}}>⬇ Download Template</button>
-            <button className="filter-btn" onClick={exportCurrentData} style={{flex:1,padding:'10px'}}>📊 Export Current Data</button>
+            <button className="filter-btn" onClick={exportCurrentData} style={{flex:1,padding:'10px'}}>📊 Export Current ({data.length} rows)</button>
           </div>
         </div>
+
         <div className="chart-card">
           <div className="chart-title">Column Mapping Guide</div>
-          <div className="chart-sub">REQUIRED COLUMNS IN YOUR EXCEL</div>
-          <table style={{marginTop:12}}>
-            <thead><tr><th>COLUMN</th><th>DESCRIPTION</th><th>EXAMPLE</th></tr></thead>
+          <div className="chart-sub">ACCEPTED COLUMN NAMES (ANY VARIATION WORKS)</div>
+          <div style={{fontSize:10,letterSpacing:2,color:'var(--text-muted)',fontFamily:'Share Tech Mono,monospace',marginBottom:6}}>YOUR EXCEL COLUMNS (VELAN FORMAT)</div>
+          <div style={{overflowX:'auto',marginTop:8}}>
+          <table>
+            <thead><tr><th>YOUR COLUMN</th><th>MAPS TO</th><th>NOTES</th></tr></thead>
             <tbody>
-              {[['SC','Job set number','1170'],['PO NO','Purchase order','AGIPLPO2326'],['PO RECD DATE','Date received','2026-03-25'],['Product Name','Product description','ARG DIA 15.2'],['type','Product type','APG,ARG,SRG,SP'],['STATUS 1','Current operation','LATHE COMPLETED'],['STATUS 2','Next operation','MOVE TO STORES'],['INHOUSE/ VENDOR','Where processed','INHOUSE or VENDOR'],['currentStage','Current stage code','READY,STORES,LATHE'],['timestamp','Last updated time','2026-04-15 19:20:04']].map(([col,desc,ex],i)=>(
-                <tr key={i}><td className="mono text-accent">{col}</td><td style={{fontSize:11}}>{desc}</td><td style={{fontSize:10,color:'var(--text-muted)'}}>{ex}</td></tr>
+              {[
+                ['SC',              'Job Set No',       'Required. Fills down within each gauge set'],
+                ['PO NO',           'Purchase Order',   'Required. Fills down within each PO group'],
+                ['PO RECD DATE',    'PO Date',          'Date the PO was received'],
+                ['Product Name',    'Product',          'Required. Type is AUTO-DETECTED from name prefix'],
+                ['STATUS 1',        'Current Operation','What is happening now'],
+                ['STATUS 2',        'Next Operation',   'Where it moves after current op'],
+                ['INHOUSE/ VENDOR', 'Location',         '"INHOUSE" or "VENDOR"'],
+                ['OP',              'Current Stage',    'Stage code: READY, LATHE, CG, VA, STORES etc.'],
+                ['TIMESTAMP',       'Last Updated',     'Date-time of last status update'],
+                ['type column',     '(not needed)',     '✅ Auto-inferred from Product Name prefix (APG/SRG/ARG/SP...)'],
+              ].map(([col,maps,note],i)=>(
+                <tr key={i}>
+                  <td className="mono text-accent" style={{whiteSpace:'nowrap'}}>{col}</td>
+                  <td style={{fontSize:11,color:'var(--text-secondary)',whiteSpace:'nowrap'}}>{maps}</td>
+                  <td style={{fontSize:10,color:'var(--text-muted)'}}>{note}</td>
+                </tr>
               ))}
             </tbody>
           </table>
+          </div>
         </div>
       </div>
+
       <div className="chart-card">
         <div className="chart-title">Current Data Preview — {data.length} rows loaded</div>
         <div className="chart-sub">FIRST 50 ROWS OF ACTIVE DATASET</div>
@@ -1446,10 +1665,14 @@ function UploadPage({onUpload, data}) {
                 <td className="mono text-accent">{r.sc}</td>
                 <td style={{fontSize:11}}>{r.po}</td>
                 <td style={{fontSize:11,maxWidth:200,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{r.product}</td>
-                <td><span className="status-pill badge-blue">{r.type}</span></td>
-                <td><span className="status-pill" style={{background:getStageColor(r.currentStage)+'22',color:getStageColor(r.currentStage)}}>{r.currentStage}</span></td>
-                <td>{r.inhouse}</td>
-                <td className="mono" style={{fontSize:10}}>{r.timestamp?.substring(0,16)}</td>
+                <td><span className="status-pill badge-blue">{r.type||'—'}</span></td>
+                <td>
+                  <span className="status-pill" style={{background:getStageColor(r.currentStage)+'22',color:getStageColor(r.currentStage)}}>
+                    {r.currentStage||'—'}
+                  </span>
+                </td>
+                <td><span className={`status-pill ${r.inhouse==='VENDOR'?'s-vendor':'badge-blue'}`}>{r.inhouse}</span></td>
+                <td className="mono" style={{fontSize:10}}>{r.timestamp?.substring(0,16)||'—'}</td>
               </tr>
             ))}</tbody>
           </table>
